@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Filtr twarzy – makijaż i usuwanie zarostu</title>
+<style>
+  :root { --bg:#111; --panel:#1c1c1f; --txt:#eee; --acc:#e0607e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt); font-family:system-ui,-apple-system,sans-serif; }
+  #stage { position:relative; width:100%; max-width:720px; margin:0 auto; }
+  canvas#out { width:100%; display:block; transform:scaleX(-1); background:#000; }
+  video { display:none; }
+  #status { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; text-align:center; padding:20px; background:#000c; }
+  button { font:inherit; border:0; border-radius:999px; padding:12px 22px; background:var(--acc); color:#fff; font-weight:600; }
+  button.ghost { background:#333; }
+  #panel { max-width:720px; margin:0 auto; padding:12px 16px 28px; display:grid; gap:10px; }
+  .row { display:grid; grid-template-columns:130px 1fr 38px; align-items:center; gap:10px; font-size:14px; }
+  .row span:last-child { text-align:right; opacity:.7; }
+  input[type=range] { width:100%; accent-color:var(--acc); }
+  .btns { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:6px; }
+  #shot { max-width:720px; margin:0 auto; padding:0 16px 30px; display:none; text-align:center; }
+  #shot img { width:100%; border-radius:12px; }
+  small { opacity:.6; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="vid" playsinline muted></video>
+  <canvas id="out" width="640" height="480"></canvas>
+  <div id="status">
+    <div>Filtr działa w całości w Twoim telefonie – obraz nigdzie nie jest wysyłany.</div>
+    <button id="start">Włącz kamerę</button>
+    <small id="msg"></small>
+  </div>
+</div>
+
+<div id="panel">
+  <div class="row"><label>Usuń zarost</label><input id="beard" type="range" min="0" max="100" value="80"><span></span></div>
+  <div class="row"><label>Wygładzenie skóry</label><input id="smooth" type="range" min="0" max="100" value="50"><span></span></div>
+  <div class="row"><label>Szminka</label><input id="lips" type="range" min="0" max="100" value="55"><span></span></div>
+  <div class="row"><label>Kolor ust</label><input id="lipColor" type="color" value="#c2185b"><span></span></div>
+  <div class="row"><label>Róż</label><input id="blush" type="range" min="0" max="100" value="40"><span></span></div>
+  <div class="row"><label>Oczy (kreska, cień)</label><input id="eyes" type="range" min="0" max="100" value="55"><span></span></div>
+  <div class="btns">
+    <button id="compare" class="ghost">Przytrzymaj: bez filtra</button>
+    <button id="photo">Zrób zdjęcie</button>
+  </div>
+</div>
+<div id="shot">
+  <img id="shotImg" alt="Zdjęcie z filtrem">
+  <p><a id="shotLink" download="filtr.png" style="color:var(--acc)">Pobierz zdjęcie</a><br><small>Na telefonie możesz też przytrzymać zdjęcie i wybrać „Zapisz”.</small></p>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- punkty siatki MediaPipe (468) ----------
+const OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+const LIPS_OUT = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+const LIPS_IN  = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
+const EYE_A = [33,246,161,160,159,158,157,173,133,155,154,153,145,144,163,7];
+const EYE_B = [362,398,384,385,386,387,388,466,263,249,390,373,374,380,381,382];
+const LID_A = [33,246,161,160,159,158,157,173,133];       // górna powieka (kącik zewn. -> wewn.)
+const LID_B = [263,466,388,387,386,385,384,398,362];
+const BROW_A = [46,53,52,65,55];
+const BROW_B = [276,283,282,295,285];
+// obszar zarostu: linia żuchwy + granica pod kośćmi policzkowymi i pod nosem (wąsy)
+const BEARD = [234,93,132,58,172,136,150,149,176,148,152,377,400,378,379,365,397,288,361,323,454,
+               352,411,425,327,2,98,205,187,123];
+const SKIN_SAMPLES = [50,280,118,347,101,330];
+
+const $ = id => document.getElementById(id);
+const video = $("vid"), out = $("out"), ctx = out.getContext("2d");
+const ui = {}; ["beard","smooth","lips","blush","eyes"].forEach(k => {
+  ui[k] = $(k); const s = ui[k].nextElementSibling;
+  const upd = () => s.textContent = ui[k].value; ui[k].addEventListener("input", upd); upd();
+});
+const val = k => ui[k].value / 100;
+
+let W = 640, H = 480, landmarker = null, pts = null, skin = [200,160,140], raw = false;
+
+// ---------- pomocnicze płótna ----------
+const mk = () => document.createElement("canvas");
+const fx = mk(), mask = mk(), soft = mk(), snap = mk(), tmpA = mk(), tmpB = mk(), sampler = mk();
+const fctx = fx.getContext("2d"), mctx = mask.getContext("2d"), sctx = soft.getContext("2d"), snctx = snap.getContext("2d");
+const samp = sampler.getContext("2d", { willReadFrequently:true });
+sampler.width = 160; sampler.height = 120;
+
+// szum (ziarno skóry)
+const noise = mk(); noise.width = noise.height = 128;
+{ const n = noise.getContext("2d"), d = n.createImageData(128,128);
+  for (let i=0;i<d.data.length;i+=4){ const v=110+Math.random()*36; d.data[i]=d.data[i+1]=d.data[i+2]=v; d.data[i+3]=255; }
+  n.putImageData(d,0,0); }
+
+function resize(w,h){ W=w; H=h; [out,fx,mask,soft,snap].forEach(c=>{c.width=w;c.height=h;}); }
+
+// rozmycie przez kolejne pomniejszanie i powiększenie (działa też w Safari)
+function blurTo(dctx, src, f){
+  let cw = src.width, ch = src.height, cur = src, flip = false;
+  const tw = Math.max(2, Math.round(src.width/f)), th = Math.max(2, Math.round(src.height/f));
+  while (cw/2 >= tw) {
+    cw = Math.round(cw/2); ch = Math.round(ch/2);
+    const t = flip ? tmpB : tmpA; flip = !flip;
+    if (t.width !== cw || t.height !== ch) { t.width = cw; t.height = ch; }
+    const tc = t.getContext("2d"); tc.clearRect(0,0,cw,ch); tc.drawImage(cur,0,0,cw,ch); cur = t;
+  }
+  dctx.imageSmoothingEnabled = true; dctx.imageSmoothingQuality = "high";
+  dctx.drawImage(cur,0,0,cur===src?src.width:cw,cur===src?src.height:ch,0,0,W,H);
+}
+
+const P = i => pts[i];
+function smoothPath(c, idx){
+  const p = idx.map(P), n = p.length;
+  const mid = (a,b)=>[(a[0]+b[0])/2,(a[1]+b[1])/2];
+  let m = mid(p[n-1],p[0]); c.moveTo(m[0],m[1]);
+  for (let i=0;i<n;i++){ const q=p[i], m2=mid(p[i],p[(i+1)%n]); c.quadraticCurveTo(q[0],q[1],m2[0],m2[1]); }
+  c.closePath();
+}
+const dist = (a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
+
+// rysuje efekt w fx, przycina miękką maską i nakłada na obraz
+function masked(drawFx, buildMask, softness, alpha){
+  if (alpha <= 0.001) return;
+  fctx.globalCompositeOperation="source-over"; fctx.globalAlpha=1; fctx.clearRect(0,0,W,H);
+  drawFx(fctx);
+  mctx.clearRect(0,0,W,H); mctx.fillStyle="#fff"; mctx.beginPath(); buildMask(mctx); mctx.fill("evenodd");
+  sctx.clearRect(0,0,W,H); blurTo(sctx, mask, softness);
+  fctx.globalCompositeOperation="destination-in"; fctx.drawImage(soft,0,0);
+  fctx.globalCompositeOperation="source-over";
+  ctx.globalAlpha = alpha; ctx.drawImage(fx,0,0); ctx.globalAlpha = 1;
+}
+
+function sampleSkin(){
+  samp.drawImage(video,0,0,160,120);
+  const d = samp.getImageData(0,0,160,120).data;
+  let r=0,g=0,b=0,n=0;
+  for (const i of SKIN_SAMPLES){
+    const x=Math.round(pts[i][0]/W*160), y=Math.round(pts[i][1]/H*120);
+    for (let dx=-1;dx<=1;dx++) for (let dy=-1;dy<=1;dy++){
+      const xx=Math.min(159,Math.max(0,x+dx)), yy=Math.min(119,Math.max(0,y+dy)), o=(yy*160+xx)*4;
+      r+=d[o]; g+=d[o+1]; b+=d[o+2]; n++;
+    }
+  }
+  const c=[r/n,g/n,b/n];
+  skin = skin.map((v,k)=>v+(c[k]-v)*0.15);   // wygładzenie w czasie, bez migotania
+}
+
+function render(){
+  ctx.globalCompositeOperation="source-over"; ctx.globalAlpha=1;
+  ctx.drawImage(video,0,0,W,H);
+  if (!pts || raw) return;
+
+  const faceW = dist(P(234),P(454));
+  const sf = Math.min(28, Math.max(4, faceW*0.05));
+  sampleSkin();
+  const skinCss = `rgb(${skin.map(Math.round).join(",")})`;
+
+  // 1) usuwanie zarostu i wąsów
+  masked(c=>{
+    blurTo(c, video, Math.max(12, faceW*0.09));
+    c.globalAlpha=0.82; c.fillStyle=skinCss; c.fillRect(0,0,W,H); c.globalAlpha=1;
+    const g=c.createLinearGradient(0,P(2)[1],0,P(152)[1]);
+    g.addColorStop(0,"rgb(255,255,255)"); g.addColorStop(1,"rgb(222,212,206)");
+    c.globalCompositeOperation="multiply"; c.fillStyle=g; c.fillRect(0,0,W,H);
+    c.globalCompositeOperation="overlay"; c.globalAlpha=0.25; c.fillStyle=c.createPattern(noise,"repeat"); c.fillRect(0,0,W,H);
+    c.globalAlpha=1; c.globalCompositeOperation="source-over";
+  }, m=>{ smoothPath(m,BEARD); smoothPath(m,LIPS_OUT); }, sf, val("beard"));
+
+  // 2) wygładzenie skóry (bez oczu, brwi i ust)
+  snctx.clearRect(0,0,W,H); snctx.drawImage(out,0,0);
+  masked(c=>blurTo(c, snap, Math.max(6, faceW*0.035)),
+    m=>{ smoothPath(m,OVAL); smoothPath(m,EYE_A); smoothPath(m,EYE_B); smoothPath(m,LIPS_OUT); },
+    sf, val("smooth")*0.75);
+
+  // 3) róż
+  const bl = val("blush");
+  if (bl>0){
+    ctx.save(); ctx.globalCompositeOperation="multiply";
+    for (const i of [50,280]){
+      const [x,y]=P(i), r=faceW*0.14, g=ctx.createRadialGradient(x,y,0,x,y,r);
+      g.addColorStop(0,`rgba(255,120,140,${0.45*bl})`); g.addColorStop(1,"rgba(255,120,140,0)");
+      ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // 4) oczy: cień + kreska z „jaskółką”
+  const ey = val("eyes");
+  if (ey>0){
+    for (const [lid,brow] of [[LID_A,BROW_A],[LID_B,BROW_B]]){
+      const bc = brow.map(P).reduce((a,p)=>[a[0]+p[0]/brow.length,a[1]+p[1]/brow.length],[0,0]);
+      const up = lid.map(i=>{ const p=P(i); return [p[0]+(bc[0]-p[0])*0.45, p[1]+(bc[1]-p[1])*0.45]; });
+      ctx.save(); ctx.globalCompositeOperation="multiply"; ctx.globalAlpha=0.35*ey; ctx.fillStyle="rgb(170,120,130)";
+      ctx.beginPath(); lid.forEach((i,k)=>{const p=P(i); k?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]);});
+      for (let k=up.length-1;k>=0;k--) ctx.lineTo(up[k][0],up[k][1]);
+      ctx.closePath(); ctx.fill(); ctx.restore();
+
+      const outer=P(lid[0]), inner=P(lid[lid.length-1]);
+      const dx=outer[0]-inner[0], dy=outer[1]-inner[1], L=Math.hypot(dx,dy);
+      const wing=[outer[0]+dx/L*faceW*0.04, outer[1]+dy/L*faceW*0.04 - faceW*0.025];
+      ctx.save(); ctx.globalAlpha=0.85*ey; ctx.strokeStyle="#1a1012"; ctx.lineCap="round"; ctx.lineJoin="round";
+      ctx.lineWidth=Math.max(1.5, faceW*0.012);
+      ctx.beginPath(); ctx.moveTo(wing[0],wing[1]);
+      lid.forEach(i=>{const p=P(i); ctx.lineTo(p[0],p[1]-faceW*0.004);});
+      ctx.stroke(); ctx.restore();
+    }
+  }
+
+  // 5) szminka
+  const lp = val("lips");
+  if (lp>0){
+    const col = ui.lipColor.value;
+    masked(c=>{
+      c.drawImage(out,0,0);
+      c.globalCompositeOperation="multiply"; c.fillStyle=col; c.globalAlpha=0.8; c.fillRect(0,0,W,H);
+      c.globalCompositeOperation="soft-light"; c.globalAlpha=0.35; c.fillRect(0,0,W,H);
+      c.globalAlpha=1; c.globalCompositeOperation="source-over";
+    }, m=>{ smoothPath(m,LIPS_OUT); smoothPath(m,LIPS_IN); }, Math.max(2, faceW*0.012), lp);
+  }
+}
+
+let lastT = -1;
+function loop(){
+  if (video.readyState >= 2 && landmarker){
+    const t = performance.now();
+    if (t !== lastT){
+      lastT = t;
+      const res = landmarker.detectForVideo(video, t);
+      const f = res.faceLandmarks && res.faceLandmarks[0];
+      if (f){
+        const cur = f.map(p=>[p.x*W, p.y*H]);
+        if (!pts) pts = cur;
+        else pts = pts.map((p,i)=>[p[0]+(cur[i][0]-p[0])*0.6, p[1]+(cur[i][1]-p[1])*0.6]);
+      } else pts = null;
+    }
+    render();
+  }
+  requestAnimationFrame(loop);
+}
+
+async function start(){
+  const msg = $("msg"), btn = $("start");
+  btn.disabled = true; msg.textContent = "Uruchamiam kamerę…";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:640}, height:{ideal:480} }, audio:false });
+    video.srcObject = stream; await video.play();
+    resize(video.videoWidth, video.videoHeight);
+    msg.textContent = "Ładuję model rozpoznawania twarzy (ok. 4 MB)…";
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = d => ({ baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate:d }, runningMode:"VIDEO", numFaces:1 });
+    try { landmarker = await FaceLandmarker.createFromOptions(files, opts("GPU")); }
+    catch { landmarker = await FaceLandmarker.createFromOptions(files, opts("CPU")); }
+    $("status").style.display = "none";
+    loop();
+  } catch(e){
+    btn.disabled = false;
+    msg.textContent = "Nie udało się: " + (e && e.message ? e.message : e) + ". Strona musi być otwarta przez https:// (lub z pliku na komputerze) i mieć zgodę na kamerę.";
+  }
+}
+$("start").addEventListener("click", start);
+
+const cmp = $("compare");
+const on = e=>{ e.preventDefault(); raw=true; }, off = ()=>{ raw=false; };
+cmp.addEventListener("pointerdown", on); ["pointerup","pointerleave","pointercancel"].forEach(ev=>cmp.addEventListener(ev, off));
+
+$("photo").addEventListener("click", ()=>{
+  const c = mk(); c.width=W; c.height=H; const x=c.getContext("2d");
+  x.translate(W,0); x.scale(-1,1); x.drawImage(out,0,0);
+  const url = c.toDataURL("image/png");
+  $("shotImg").src = url; $("shotLink").href = url; $("shot").style.display = "block";
+  $("shot").scrollIntoView({ behavior:"smooth" });
+});
+</script>
+</body>
+</html>
